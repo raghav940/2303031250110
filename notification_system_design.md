@@ -115,3 +115,80 @@ Given the need for real-time delivery and potential bidirectional communication,
 }
 ```
 When a new notification is generated in the backend, it will be published to a message broker (like Redis Pub/Sub), which the WebSocket servers subscribe to and push the event directly to the active connection of the designated student.
+
+---
+
+# Stage 2
+
+## Persistent Storage Suggestion
+**Recommendation:** PostgreSQL (Relational Database)
+**Reasoning:**
+- **Data Integrity:** Notifications map cleanly to structured data, where consistency between users, notification types, and statuses is essential.
+- **Complex Queries:** PostgreSQL handles complex filtering, indexing, and sorting exceptionally well, which is necessary when retrieving paginated and filtered notifications.
+- **JSONB Support:** If payloads become unstructured later, PostgreSQL supports JSONB columns to give NoSQL-like flexibility within a relational table.
+- **Reliability:** ACID compliance ensures states (like `is_read = true`) are not lost or rendered inconsistent.
+
+## Database Schema
+```sql
+CREATE TYPE notification_type AS ENUM ('Event', 'Result', 'Placement');
+
+CREATE TABLE students (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    roll_number VARCHAR(100) UNIQUE NOT NULL
+);
+
+CREATE TABLE notifications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id INT NOT NULL,
+    type notification_type NOT NULL,
+    message TEXT NOT NULL,
+    is_read BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    
+    CONSTRAINT fk_student
+      FOREIGN KEY(student_id) 
+      REFERENCES students(id)
+);
+
+-- Indexes to optimize the endpoints
+CREATE INDEX idx_notifications_student_read_created ON notifications(student_id, is_read, created_at DESC);
+```
+
+## Potential Problems with Data Volume Increase
+1. **Query Degradation:** As the notifications table exceeds millions of rows, querying unread notifications or running complex filters will lead to slow index scans or sequential scans.
+2. **Storage Costs & Bloat:** Storing historical, read notifications indefinitely will bloat table size and make vacuuming and index maintenance expensive.
+3. **Write Bottlenecks:** Sending notifications to 50,000 users simultaneously triggers high write IOPS and possible row locks.
+
+## Solutions to Data Volume Problems
+1. **Partitioning:** Implement Table Partitioning by date (e.g., partitioning by month or year) to separate fresh data from historical data. 
+2. **Data Retention Policy:** Implement a cron job to automatically archive or delete notifications older than 6 months.
+3. **Caching:** Cache the `unread_count` for users in Redis. Invalidate the cache when a new notification is sent or when notifications are marked as read.
+4. **Message Broker / Async Inserts:** Buffer bulk notifications (e.g., "Notify All") in a message queue (Kafka/RabbitMQ) and batch-insert them asynchronously.
+
+## Queries Based on Stage 1 APIs
+
+### 1. Fetch Notifications (Paginated & Filterable)
+```sql
+SELECT id, type, message, is_read, created_at 
+FROM notifications 
+WHERE student_id = $1 
+  AND ($2::notification_type IS NULL OR type = $2)
+  AND ($3::boolean IS NULL OR is_read = $3)
+ORDER BY created_at DESC 
+LIMIT $4 OFFSET $5;
+```
+
+### 2. Mark Notification(s) as Read
+```sql
+UPDATE notifications 
+SET is_read = true 
+WHERE id = ANY($1::uuid[]) AND student_id = $2;
+```
+
+### 3. Get Unread Count
+```sql
+SELECT COUNT(id) 
+FROM notifications 
+WHERE student_id = $1 AND is_read = false;
+```
