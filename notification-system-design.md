@@ -1,3 +1,4 @@
+# Notification System Design
 # Stage 1
 
 ## Core Actions
@@ -272,3 +273,70 @@ Replaces heavy HTTP request overhead (headers, TLS handshakes, DB fetches) with 
 
 ### Conclusion / Recommended Approach
 Implement **Redis Caching** for the `unread_count` and the first page of notifications. Combine this with **WebSockets** (established in Stage 1) so that page reloads fetch from the fast Redis cache, while active sessions receive real-time pushes without querying the database at all.
+
+---
+
+# Stage 5
+
+## Shortcomings of the Proposed Implementation
+1. **Synchronous Blocking:** The `for` loop executes sequentially and synchronously. If `send_email` takes 500ms, processing 50,000 students will take over 6 hours, which is unacceptable for real-time notifications.
+2. **Lack of Fault Tolerance & Retries:** If `send_email` fails on the 200th user, the loop breaks or skips without any retry mechanism. The remaining 49,800 students might not get their notifications, and there is no tracking of who received it and who didn't.
+3. **No Distributed Processing:** A single loop runs on a single server, making it a severe bottleneck. It cannot utilize multiple workers or servers to speed up the process.
+
+## Resolving the 200 Failed Emails
+Since there is no dead-letter queue (DLQ) or state tracking, we must manually write a script to cross-reference the database (`save_to_db` records) against the students array. However, because `send_email` happened *before* `save_to_db`, if it crashed, the DB record wasn't created. We would need to identify the exact student ID where it crashed and resume the script from that point, which is highly error-prone.
+
+## Reliable and Fast Redesign (Message Queues)
+We need to decouple the generation of the notification from the delivery mechanisms using a Message Queue like **RabbitMQ** or **Kafka**.
+
+1. **Producer:** The API endpoint quickly validates the request and publishes a single event `notify_all_requested` to the message broker.
+2. **Fan-out:** A worker service consumes this event, retrieves the 50,000 student IDs, and publishes 50,000 individual `notification_task` messages to a worker queue.
+3. **Consumer Workers:** A pool of horizontally scaled workers pick up these tasks. Each task asynchronously executes DB insertion, Email, and Push notification independently.
+
+## Should DB Saving and Email Sending Happen Together?
+**No.** They should be decoupled. 
+Database insertion is fast and internal. Email sending relies on a third-party API (like SendGrid/AWS SES) which is slow and prone to network errors or rate limits. If the email API times out, it should not prevent the notification from being saved in the database or pushed to the mobile app. Each delivery method (DB, Email, Push) should be an independent, idempotent task that can retry on its own failure without affecting the others.
+
+## Revised Pseudocode
+```python
+# Producer Service (Fast Response to HR)
+function notify_all(student_ids: array, message: string):
+    # Just push tasks to the queue and return HTTP 200 immediately
+    for student_id in student_ids:
+        message_broker.publish('notification_queue', {
+            'student_id': student_id,
+            'message': message
+        })
+
+# Worker Service (Running across multiple servers)
+function process_notification_worker(job):
+    student_id = job.student_id
+    message = job.message
+    
+    # Execute independently, handling their own retries
+    async_run(save_to_db(student_id, message))
+    async_run(push_to_app(student_id, message))
+    
+    # If this fails, the job can be pushed to a Dead Letter Queue to retry later
+    try:
+        send_email(student_id, message)
+    except Exception:
+        message_broker.publish('retry_email_queue', job)
+```
+
+---
+
+# Stage 6
+
+## Priority Inbox Approach
+**Objective:** Maintain a dynamic top 10 list of notifications based on weight (`Placement > Result > Event`) and recency.
+
+**Implementation Details:**
+1. **Weight Mapping:** We mapped weights to the types: Placement (3), Result (2), Event (1).
+2. **Custom Sorting Logic:** We sort the notifications array by these weights in descending order. If the weights are identical (e.g., two Placement notifications), we fallback to sorting by `Timestamp` in descending order (most recent first).
+3. **Extraction:** Once sorted, we slice the top `N` elements (10 in this case) to get the Priority Inbox view.
+4. **Output Generation:** Since `console.log` is strictly prohibited by the evaluation guidelines, the script outputs the result to a `stage6_output.json` file to allow for easy screenshot verification.
+
+**How to maintain the top 10 efficiently as new notifications arrive:**
+1. **Priority Queue / Max Heap:** Instead of re-sorting the entire array every time a new notification arrives (O(N log N)), we can maintain a Priority Queue (Max Heap) where the comparator utilizes the weight+recency logic. Inserting a new notification is O(log N).
+2. **Sorted Sets (Redis):** If this list needs to be globally maintained per user without computing it on the fly, we can use a Redis Sorted Set (`ZADD`). The score can be a composite float where the integer part is the weight (1, 2, or 3) and the decimal part is the epoch timestamp. Redis automatically keeps this sorted, and we simply `ZREVRANGE 0 9` to fetch the top 10 in O(log(N)+M) time.

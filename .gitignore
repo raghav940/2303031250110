@@ -3,3 +3,5 @@ implementation_plan.md
 raw_docs_text.md
 .DS_Store
 logger/dist/
+stage6_priority_inbox.js
+logging-middleware/*.js
