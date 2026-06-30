@@ -1,0 +1,5 @@
+node_modules/
+implementation_plan.md
+raw_docs_text.md
+.DS_Store
+logger/dist/
