@@ -192,3 +192,41 @@ SELECT COUNT(id)
 FROM notifications 
 WHERE student_id = $1 AND is_read = false;
 ```
+
+---
+
+# Stage 3
+
+## Query Analysis
+**Original Query:**
+```sql
+SELECT * FROM notifications WHERE studentID = 1042 AND isRead = false ORDER BY createdAt ASC;
+```
+
+**Is this query accurate?**
+Yes, it is logically accurate for fetching unread notifications for a specific student, sorted by oldest first.
+
+**Why is this slow?**
+The database has grown to 5,000,000 rows. Without a composite index covering `studentID` and `isRead`, the database is forced to perform a Full Table Scan (or Sequential Scan) across all 5 million rows to find matches for `studentID = 1042`, followed by an in-memory or on-disk sort for the `ORDER BY` clause.
+
+**What would you change and what would be the likely computation cost?**
+1. **Change:** Add a composite index on `(studentID, isRead, createdAt ASC)`. 
+2. **Cost impact:** With this index, the query planner can perform an Index Seek directly to the rows for that student where `isRead = false`. Because the index includes `createdAt`, the rows are retrieved already sorted. The time complexity drops from O(N) (where N is total rows) to O(log N + K) (where K is the number of unread notifications for the student), virtually eliminating the performance bottleneck.
+
+## Advice on Adding Indexes on Every Column
+**Is this advice effective?**
+No, it is highly ineffective and dangerous for a high-scale production database.
+
+**Why/Why not?**
+1. **Write Performance Penalty:** Every `INSERT`, `UPDATE`, or `DELETE` operation requires updating every single index. Adding indexes on all columns will severely degrade write performance, which is catastrophic for a system expected to handle bursts of notifications (e.g., 50,000 at once).
+2. **Storage Bloat:** Indexes take up disk space and memory. Indexing every column will multiply the storage requirements of the database unnecessarily, reducing cache hit rates as memory fills up with useless indexes.
+3. **Query Planner Confusion:** Too many overlapping or unnecessary indexes can cause the query planner to pick suboptimal execution plans. Indexes should only be created to support specific, high-frequency, or slow queries.
+
+## Query for Placement Notifications in the Last 7 Days
+```sql
+SELECT DISTINCT student_id 
+FROM notifications 
+WHERE type = 'Placement' 
+  AND created_at >= NOW() - INTERVAL '7 days';
+```
+*(Note: Using `DISTINCT` ensures we get a unique list of students even if they received multiple placement notifications in that timeframe).*
