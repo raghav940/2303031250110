@@ -230,3 +230,45 @@ WHERE type = 'Placement'
   AND created_at >= NOW() - INTERVAL '7 days';
 ```
 *(Note: Using `DISTINCT` ensures we get a unique list of students even if they received multiple placement notifications in that timeframe).*
+
+---
+
+# Stage 4
+
+## Problem Analysis
+Fetching notifications directly from the database on every page load for every active student causes massive Read IOPS. This overloads the database, exhausting connections and CPU, leading to high latency and a degraded user experience.
+
+## Proposed Solutions & Performance Improvements
+
+### 1. In-Memory Caching (Redis/Memcached)
+**Strategy:** 
+Cache the first page (or top N) notifications and the `unread_count` for each user in Redis. When a page loads, the application fetches the notifications from Redis. The cache is only invalidated or updated when a new notification is generated or the user marks a notification as read.
+**Performance Improvement:** 
+Drastically reduces database read queries. Memory reads are on the order of microseconds compared to milliseconds for DB disk/index seeks.
+
+**Tradeoffs:**
+- **Pros:** Massive read scalability, ultra-low latency.
+- **Cons:** Cache invalidation complexity (stale data if not handled perfectly). Increased infrastructure cost (running Redis clusters).
+
+### 2. Client-Side Caching & Local Storage
+**Strategy:**
+Leverage the browser's `localStorage` or `IndexedDB` alongside Service Workers. When the user loads a page, the UI instantly renders the locally cached notifications. A background API call (or WebSocket event) only fetches *new* notifications (using a `last_fetched_timestamp`) and merges them into the local cache.
+**Performance Improvement:**
+Eliminates redundant network requests for unchanged data. The DB only processes incremental updates rather than full list retrievals.
+
+**Tradeoffs:**
+- **Pros:** Zero database/network cost for returning visitors. Fast apparent load times for the user.
+- **Cons:** If a user logs in on a new device, the cache is cold. Storage limits in older browsers.
+
+### 3. Server-Sent Events (SSE) / WebSockets
+**Strategy:**
+Instead of polling or re-fetching on every client-side route change/page load, the frontend establishes a single persistent WebSocket/SSE connection upon authentication. The initial state is sent once, and subsequent notifications are pushed incrementally.
+**Performance Improvement:**
+Replaces heavy HTTP request overhead (headers, TLS handshakes, DB fetches) with a lightweight, persistent push model. 
+
+**Tradeoffs:**
+- **Pros:** Real-time UX. Eliminates polling.
+- **Cons:** Harder to scale horizontally (requires sticky sessions or a pub/sub backplane like Redis Pub/Sub). Connection limits on load balancers.
+
+### Conclusion / Recommended Approach
+Implement **Redis Caching** for the `unread_count` and the first page of notifications. Combine this with **WebSockets** (established in Stage 1) so that page reloads fetch from the fast Redis cache, while active sessions receive real-time pushes without querying the database at all.
